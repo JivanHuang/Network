@@ -1,4 +1,3 @@
-
 import Combine
 import Foundation
 
@@ -7,86 +6,95 @@ public enum HTTPMethod: String {
     case post = "POST"
 }
 
-@available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
-public protocol RequestType {
-    associatedtype ResponseObject: Codable
+public enum NetworkError: Error {
+    case badURL
+    case badStatus(statusCode: Int, data: Data?)
+    case unknown
+    case parse(error: Error)
+    case data(error: Error)
+}
 
-    var method: HTTPMethod { get }
-    var baseURL: String { get }
+public protocol RequestType {
+    var baseURL: URL { get }
     var path: String { get }
-    var headers: [String: String] { get }
-    var parameters: [String: Any]? { get }
-    var decoder: JSONDecoder { get }
-    func request() -> AnyPublisher<ResponseObject, Error>
+    var parameters: Encodable? { get }
+    var method: HTTPMethod { get }
 }
 
 @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
-public class Network<T: Codable>: RequestType {
-    public typealias ResponseObject = T
+public class APIClient<T: Decodable> {
+    private let session: URLSession
+    private let jsonDecoder: JSONDecoder
 
-    public var method: HTTPMethod
-    public var baseURL: String
-    public var path: String
-    public var headers: [String: String]
-    public var parameters: [String: Any]?
-    public var session: URLSession
-    public var decoder: JSONDecoder
-
-    public init(method: HTTPMethod, baseURL: String, path: String, headers: [String: String] = [:], parameters: [String: Any]?, session: URLSession = .shared, decoder: JSONDecoder = JSONDecoder()) {
-        self.method = method
-        self.baseURL = baseURL
-        self.path = path
-        self.headers = headers
-        self.parameters = parameters
+    public init(session: URLSession = .shared, jsonDecoder: JSONDecoder = JSONDecoder()) {
         self.session = session
-        self.decoder = decoder
+        self.jsonDecoder = jsonDecoder
     }
 
-    public func request() -> AnyPublisher<T, Error> {
-        guard let url = URL(string: baseURL + path) else {
-            return Fail(error: URLError(.badURL))
-                .mapError { $0 as Error }
-                .eraseToAnyPublisher()
+    public func request<U: RequestType>(_ endpoint: U) -> AnyPublisher<T, Error> {
+        var urlComponents = URLComponents(url: endpoint.baseURL, resolvingAgainstBaseURL: true)
+        urlComponents?.withPath(endpoint.path)
+        if endpoint.method == .get {
+            urlComponents?.withQueryItems(endpoint.parameters)
+        }
+
+        guard let url = urlComponents?.url else {
+            return Fail(error: NetworkError.badURL).eraseToAnyPublisher()
         }
 
         var urlRequest = URLRequest(url: url)
-        urlRequest.httpMethod = method.rawValue
-        headers.forEach { key, value in
-            urlRequest.addValue(value, forHTTPHeaderField: key)
-        }
-        if let params = parameters {
-            switch method {
-            case .get:
-                urlRequest.setQueryParameters(params)
-            case .post:
-                let data = try? JSONSerialization.data(withJSONObject: params)
+        urlRequest.httpMethod = endpoint.method.rawValue
+        if let parameters = endpoint.parameters, endpoint.method == .post {
+            do {
+                let data = try JSONEncoder().encode(parameters)
                 urlRequest.httpBody = data
+            } catch {
+                return Fail(error: NetworkError.data(error: error)).eraseToAnyPublisher()
             }
         }
+
         return session.dataTaskPublisher(for: urlRequest)
-            .mapError { $0 as Error }
-            .flatMap { data, response -> AnyPublisher<T, Error> in
-                guard let httpResponse = response as? HTTPURLResponse, 200 ..< 300 ~= httpResponse.statusCode else {
-                    return Fail(error: URLError(.badServerResponse))
-                        .mapError { $0 as Error }
-                        .eraseToAnyPublisher()
+            .tryMap { data, response in
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw NetworkError.badStatus(statusCode: 500, data: data)
                 }
-                return Just(data)
-                    .decode(type: T.self, decoder: JSONDecoder())
-                    .mapError { $0 as Error }
-                    .eraseToAnyPublisher()
+                guard 200 ... 299 ~= httpResponse.statusCode else {
+                    let code = Int(httpResponse.statusCode)
+                    throw NetworkError.badStatus(statusCode: code, data: data)
+                }
+                return data
+            }
+            .decode(type: T.self, decoder: jsonDecoder)
+            .mapError { error in
+                switch error {
+                case is URLError:
+                    return NetworkError.badURL
+                case is Swift.DecodingError:
+                    return NetworkError.parse(error: error)
+                default:
+                    return NetworkError.unknown
+                }
             }
             .eraseToAnyPublisher()
     }
 }
 
-private extension URLRequest {
-    mutating func setQueryParameters(_ parameters: [String: Any]) {
-        guard let url = url else { return }
-        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        components?.queryItems = parameters.map { key, value in
+private extension URLComponents {
+    mutating func withPath(_ path: String) {
+        self.path = path
+    }
+
+    mutating func withQueryItems(_ parameters: Encodable?) {
+        queryItems = parameters?.asDictionary?.map { key, value in
             URLQueryItem(name: key, value: "\(value)")
         }
-        self.url = components?.url
+    }
+}
+
+private extension Encodable {
+    var asDictionary: [String: Any]? {
+        guard let data = try? JSONEncoder().encode(self) else { return nil }
+        guard let dictionary = try? JSONSerialization.jsonObject(with: data, options: .allowFragments) as? [String: Any] else { return nil }
+        return dictionary
     }
 }
