@@ -22,7 +22,12 @@ public protocol RequestType {
 }
 
 @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
-public class APIClient<T: Decodable> {
+public protocol APIClientProtocol {
+    func request<T: Decodable>(_ endpoint: RequestType) -> AnyPublisher<T, Error>
+}
+
+@available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
+public class APIClient: APIClientProtocol {
     private let session: URLSession
     private let jsonDecoder: JSONDecoder
 
@@ -31,14 +36,18 @@ public class APIClient<T: Decodable> {
         self.jsonDecoder = jsonDecoder
     }
 
-    public func request<U: RequestType>(_ endpoint: U) -> AnyPublisher<T, Error> {
-        var urlComponents = URLComponents(url: endpoint.baseURL, resolvingAgainstBaseURL: true)
-        urlComponents?.withPath(endpoint.path)
+    public func request<T: Decodable>(_ endpoint: RequestType) -> AnyPublisher<T, Error> {
+        guard var urlComponents = URLComponents(url: endpoint.baseURL, resolvingAgainstBaseURL: true) else {
+            return Fail(error: NetworkError.badURL).eraseToAnyPublisher()
+        }
+        urlComponents.path = endpoint.path
         if endpoint.method == .get {
-            urlComponents?.withQueryItems(endpoint.parameters)
+            urlComponents.queryItems = endpoint.parameters?.asDictionary?.map { key, value in
+                URLQueryItem(name: key, value: "\(value)")
+            }
         }
 
-        guard let url = urlComponents?.url else {
+        guard let url = urlComponents.url else {
             return Fail(error: NetworkError.badURL).eraseToAnyPublisher()
         }
 
@@ -78,7 +87,6 @@ public class APIClient<T: Decodable> {
             .eraseToAnyPublisher()
     }
 }
-
 private extension URLComponents {
     mutating func withPath(_ path: String) {
         self.path = path
